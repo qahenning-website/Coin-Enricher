@@ -228,11 +228,24 @@ def build_enrichment_embed(ca: str) -> discord.Embed | None:
             inline=True,
         )
 
-    bubble = f"https://v2.bubblemaps.io/map?address={ca}&chain=solana"
-    embed.add_field(name="Bubblemaps V2", value=f"[Open map]({bubble})", inline=False)
-
-    embed.set_footer(text=f"CA: {ca[:6]}...{ca[-6:]} • via Birdeye")
     return embed
+
+
+def bubble_url(ca: str) -> str:
+    return f"https://v2.bubblemaps.io/map?address={ca}&chain=solana"
+
+
+def with_bubblemaps_link(text: str, ca: str) -> str:
+    link = f"[Bubblemaps V2]({bubble_url(ca)})"
+    raw = text or ""
+    if "bubblemaps" in raw.lower():
+        return raw
+    if "DexTools" in raw:
+        return raw.replace("DexTools", f"DexTools · {link}", 1)
+    if "DexScreener" in raw:
+        return raw.replace("DexScreener", f"DexScreener · {link}", 1)
+    extra = f"\n[DexScreener](https://dexscreener.com/solana/{ca}) · [DexTools](https://www.dextools.io/app/en/solana/pair-explorer/{ca}) · {link}"
+    return (raw + extra).strip()
 
 
 @client.event
@@ -247,14 +260,47 @@ async def on_message(message: discord.Message):
     if message.channel.id != WATCH_CHANNEL_ID:
         return
 
-    ca = extract_ca(message.content)
+    source_text = message.content or ""
+    if message.embeds:
+        for e in message.embeds:
+            source_text += " " + (e.title or "") + " " + (e.description or "")
+            for f in e.fields:
+                source_text += " " + (f.name or "") + " " + (f.value or "")
+
+    ca = extract_ca(source_text) or extract_ca(message.content or "")
     if not ca:
         return
 
     await asyncio.sleep(1)
-    embed = build_enrichment_embed(ca)
-    if embed:
-        await message.reply(embed=embed, mention_author=False)
+    extra = build_enrichment_embed(ca)
+    if not extra:
+        return
+
+    combined = with_bubblemaps_link(message.content or "", ca)
+    original_embeds = []
+    for e in message.embeds:
+        try:
+            original_embeds.append(discord.Embed.from_dict(e.to_dict()))
+        except Exception:
+            pass
+    embeds = (original_embeds + [extra])[:10]
+
+    try:
+        await message.delete()
+        await message.channel.send(content=combined or None, embeds=embeds)
+    except discord.Forbidden:
+        extra.add_field(
+            name="Bubblemaps V2",
+            value=f"[Open map]({bubble_url(ca)})",
+            inline=False,
+        )
+        await message.reply(embed=extra, mention_author=False)
+    except Exception as e:
+        print(f"[replace error] {e}")
+        await message.reply(embed=extra, mention_author=False)
 
 
 client.run(DISCORD_BOT_TOKEN)
+
+
+
