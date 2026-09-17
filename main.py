@@ -149,7 +149,7 @@ def format_eastern(unix_seconds: int) -> tuple[str, str]:
     age = datetime.now(timezone.utc) - launched
     hours = age.total_seconds() / 3600
     age_str = f"{hours:.1f}h ago" if hours < 48 else f"{hours / 24:.1f}d ago"
-    clock = launched_et.strftime("%Y-%m-%d %I:%M %p %Z")
+    clock = launched_et.strftime("%Y-%m-%d %I:%M %p") + " EST"
     return clock, age_str
 
 
@@ -236,16 +236,32 @@ def bubble_url(ca: str) -> str:
 
 
 def with_bubblemaps_link(text: str, ca: str) -> str:
-    link = f"[Bubblemaps V2]({bubble_url(ca)})"
+    link = f"[Bubblemaps]({bubble_url(ca)})"
     raw = text or ""
-    if "bubblemaps" in raw.lower():
+    if re.search(r"\[Bubblemaps", raw, re.I):
         return raw
-    if "DexTools" in raw:
-        return raw.replace("DexTools", f"DexTools · {link}", 1)
-    if "DexScreener" in raw:
-        return raw.replace("DexScreener", f"DexScreener · {link}", 1)
-    extra = f"\n[DexScreener](https://dexscreener.com/solana/{ca}) · [DexTools](https://www.dextools.io/app/en/solana/pair-explorer/{ca}) · {link}"
-    return (raw + extra).strip()
+
+    patched = re.sub(
+        r"(\[DexTools\]\([^)]+\))",
+        rf"\1 · {link}",
+        raw,
+        count=1,
+        flags=re.I,
+    )
+    if patched != raw:
+        return patched
+
+    patched = re.sub(
+        r"(\[DexScreener\]\([^)]+\))",
+        rf"\1 · {link}",
+        raw,
+        count=1,
+        flags=re.I,
+    )
+    if patched != raw:
+        return patched
+
+    return (raw.rstrip() + f" · {link}").strip()
 
 
 @client.event
@@ -301,6 +317,4 @@ async def on_message(message: discord.Message):
 
 
 client.run(DISCORD_BOT_TOKEN)
-
-
 
