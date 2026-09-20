@@ -1,10 +1,8 @@
 """
 Coin Enricher Bot
-Replies once under a forwarded CA with:
-  - Launch time (Eastern)
-  - Top 10 holder %
-  - Dev holding %
-  - Bubblemaps V2 link
+Replaces the forwarded coin post with one message:
+  original text + Bubblemaps link + Extra Coin Info embed
+  (launched EST, top 10 %, dev holding %)
 """
 
 import os
@@ -26,6 +24,7 @@ WATCH_CHANNEL_ID = int(os.environ["WATCH_CHANNEL_ID"])
 
 SOL_CA_REGEX = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 EASTERN = ZoneInfo("America/New_York")
+RPC_URL = "https://api.mainnet-beta.solana.com"
 
 BIRDEYE_HEADERS = {
     "X-API-KEY": BIRDEYE_API_KEY,
@@ -37,8 +36,8 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-def extract_ca(text: str) -> str | None:
-    candidates = SOL_CA_REGEX.findall(text)
+def extract_ca(text: str):
+    candidates = SOL_CA_REGEX.findall(text or "")
     for c in candidates:
         if any(ch.isdigit() for ch in c):
             return c
@@ -55,20 +54,25 @@ def birdeye_get(url: str, params: dict, label: str, ca: str):
         return None
 
 
+def rpc(method: str, params: list):
+    try:
+        r = requests.post(
+            RPC_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=12,
+        )
+        r.raise_for_status()
+        return r.json().get("result")
+    except Exception as e:
+        print(f"[rpc {method} error] {e}")
+        return None
+
+
 def get_token_overview(ca: str):
     return birdeye_get(
         "https://public-api.birdeye.so/defi/token_overview",
         {"address": ca},
         "overview",
-        ca,
-    )
-
-
-def get_token_creation_info(ca: str):
-    return birdeye_get(
-        "https://public-api.birdeye.so/defi/token_creation_info",
-        {"address": ca},
-        "creation info",
         ca,
     )
 
@@ -87,8 +91,7 @@ def get_holders(ca: str, limit: int = 20):
     return data.get("items", []) or []
 
 
-def get_dexscreener_created(ca: str) -> int | None:
-    """Unix seconds from DexScreener pairCreatedAt."""
+def get_dexscreener_created(ca: str):
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{ca}",
@@ -106,22 +109,29 @@ def get_dexscreener_created(ca: str) -> int | None:
         return None
 
 
-def get_pump_creator(ca: str) -> str | None:
-    urls = [
+def get_pump_coin(ca: str):
+    for url in (
         f"https://frontend-api.pump.fun/coins/{ca}",
         f"https://frontend-api-v3.pump.fun/coins/{ca}",
-    ]
-    for url in urls:
+    ):
         try:
             r = requests.get(url, timeout=10)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            creator = data.get("creator") or data.get("creatorAddress")
-            if creator:
-                return creator
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and data:
+                    return data
         except Exception as e:
-            print(f"[pump creator error] {ca}: {e}")
+            print(f"[pump error] {ca}: {e}")
+    return None
+
+
+def get_rugcheck(ca: str):
+    try:
+        r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{ca}/report", timeout=12)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[rugcheck error] {ca}: {e}")
     return None
 
 
@@ -143,7 +153,28 @@ def holder_owner(h: dict) -> str:
     )
 
 
-def format_eastern(unix_seconds: int) -> tuple[str, str]:
+def as_pct(value):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    if 0 < n <= 1:
+        n *= 100
+    return n
+
+
+def parse_top10_from_text(text: str):
+    if not text:
+        return None
+    m = re.search(r"top\s*10[^0-9%]{0,16}(\d+(?:\.\d+)?)\s*%", text, re.I)
+    if not m:
+        return None
+    return as_pct(m.group(1))
+
+
+def format_eastern(unix_seconds: int):
     launched = datetime.fromtimestamp(unix_seconds, tz=timezone.utc)
     launched_et = launched.astimezone(EASTERN)
     age = datetime.now(timezone.utc) - launched
@@ -153,81 +184,129 @@ def format_eastern(unix_seconds: int) -> tuple[str, str]:
     return clock, age_str
 
 
-def build_enrichment_embed(ca: str) -> discord.Embed | None:
+def get_onchain_supply(ca: str):
+    result = rpc("getTokenSupply", [ca])
+    if not result:
+        return None
+    value = (result.get("value") or {}) if isinstance(result, dict) else {}
+    ui = value.get("uiAmount")
+    try:
+        return float(ui) if ui is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_wallet_token_pct(wallet: str, mint: str, supply):
+    result = rpc(
+        "getTokenAccountsByOwner",
+        [wallet, {"mint": mint}, {"encoding": "jsonParsed"}],
+    )
+    if result is None:
+        return None
+    accounts = result.get("value") if isinstance(result, dict) else None
+    if not accounts:
+        return 0.0
+    held = 0.0
+    for acc in accounts:
+        info = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        tok = info.get("tokenAmount") or {}
+        ui = tok.get("uiAmount")
+        try:
+            held += float(ui or 0)
+        except (TypeError, ValueError):
+            pass
+    if not supply or supply <= 0:
+        return 0.0 if held == 0 else None
+    return (held / supply) * 100
+
+
+def find_creator(ca: str, pump, rug):
+    if pump:
+        creator = pump.get("creator") or pump.get("creatorAddress")
+        if creator:
+            return creator
+    if rug:
+        creator = rug.get("creator") or (rug.get("token") or {}).get("creator")
+        if creator:
+            return creator
+    return None
+
+
+def build_enrichment_embed(ca: str, source_text: str = ""):
     overview = get_token_overview(ca)
     time.sleep(1.2)
-    creation = get_token_creation_info(ca)
-    time.sleep(1.2)
     holders = get_holders(ca)
+    if not holders:
+        time.sleep(1.4)
+        holders = get_holders(ca)
+
+    pump = get_pump_coin(ca)
+    rug = get_rugcheck(ca)
 
     embed = discord.Embed(title="Extra Coin Info", color=0x5865F2)
 
     unix_time = None
-    if creation:
-        unix_time = creation.get("blockUnixTime") or creation.get("block_unix_time")
+    if pump and pump.get("created_timestamp"):
+        ts = pump["created_timestamp"]
+        unix_time = int(ts / 1000) if ts > 10_000_000_000 else int(ts)
     if not unix_time:
         unix_time = get_dexscreener_created(ca)
-
     if unix_time:
         clock, age_str = format_eastern(int(unix_time))
-        embed.add_field(
-            name="Launched",
-            value=f"{clock} ({age_str})",
-            inline=False,
-        )
+        embed.add_field(name="Launched", value=f"{clock} ({age_str})", inline=False)
 
     total_supply = None
     if overview:
-        total_supply = (
+        raw_supply = (
             overview.get("supply")
             or overview.get("totalSupply")
             or overview.get("circulatingSupply")
         )
         try:
-            total_supply = float(total_supply) if total_supply is not None else None
+            total_supply = float(raw_supply) if raw_supply is not None else None
         except (TypeError, ValueError):
             total_supply = None
+    if not total_supply:
+        total_supply = get_onchain_supply(ca)
 
+    top10_pct = None
     if holders and total_supply:
-        top10_amount = sum(holder_amount(h) for h in holders[:10])
-        top10_pct = (top10_amount / total_supply) * 100
-        embed.add_field(name="Top 10 Holders", value=f"{top10_pct:.1f}%", inline=True)
-    elif holders:
-        percents = []
+        top10_pct = (sum(holder_amount(h) for h in holders[:10]) / total_supply) * 100
+    if top10_pct is None and holders:
+        parts = []
         for h in holders[:10]:
-            p = h.get("percentage") or h.get("percent") or h.get("ui_percentage")
-            if p is not None:
-                try:
-                    percents.append(float(p))
-                except (TypeError, ValueError):
-                    pass
-        if percents:
-            embed.add_field(
-                name="Top 10 Holders",
-                value=f"{sum(percents):.1f}%",
-                inline=True,
-            )
+            n = as_pct(h.get("percentage") or h.get("percent") or h.get("ui_percentage"))
+            if n is not None:
+                parts.append(n)
+        if parts:
+            top10_pct = sum(parts)
+    if top10_pct is None and rug:
+        top_list = rug.get("topHolders") or []
+        if top_list:
+            s = 0.0
+            for h in top_list[:10]:
+                n = as_pct(h.get("pct") or h.get("percent"))
+                if n is not None:
+                    s += n
+            if s:
+                top10_pct = s
+    if top10_pct is None:
+        top10_pct = parse_top10_from_text(source_text)
+    if top10_pct is not None:
+        embed.add_field(name="Top 10 Holders", value=f"{top10_pct:.1f}%", inline=True)
 
-    dev_wallet = None
-    if creation:
-        dev_wallet = creation.get("creator") or creation.get("owner")
-    if not dev_wallet:
-        dev_wallet = get_pump_creator(ca)
+    creator = find_creator(ca, pump, rug)
+    dev_pct = None
+    if creator and total_supply:
+        dev_pct = get_wallet_token_pct(creator, ca, total_supply)
+    if dev_pct is None and creator and holders and total_supply:
+        matched = next((h for h in holders if holder_owner(h) == creator), None)
+        if matched is not None:
+            dev_pct = (holder_amount(matched) / total_supply) * 100
+    if dev_pct is None:
+        dev_pct = 0.0
 
-    if dev_wallet and holders and total_supply:
-        dev_amount = next(
-            (holder_amount(h) for h in holders if holder_owner(h) == dev_wallet),
-            0,
-        )
-        dev_pct = (dev_amount / total_supply) * 100
-        embed.add_field(name="Dev Holding", value=f"{dev_pct:.2f}%", inline=True)
-    elif dev_wallet:
-        embed.add_field(
-            name="Dev Wallet",
-            value=f"`{dev_wallet[:6]}...{dev_wallet[-4:]}`",
-            inline=True,
-        )
-
+    embed.add_field(name="Dev Holding", value=f"{dev_pct:.2f}%", inline=True)
     return embed
 
 
@@ -288,9 +367,7 @@ async def on_message(message: discord.Message):
         return
 
     await asyncio.sleep(1)
-    extra = build_enrichment_embed(ca)
-    if not extra:
-        return
+    extra = build_enrichment_embed(ca, source_text)
 
     combined = with_bubblemaps_link(message.content or "", ca)
     original_embeds = []
@@ -305,11 +382,6 @@ async def on_message(message: discord.Message):
         await message.delete()
         await message.channel.send(content=combined or None, embeds=embeds)
     except discord.Forbidden:
-        extra.add_field(
-            name="Bubblemaps V2",
-            value=f"[Open map]({bubble_url(ca)})",
-            inline=False,
-        )
         await message.reply(embed=extra, mention_author=False)
     except Exception as e:
         print(f"[replace error] {e}")
@@ -317,4 +389,3 @@ async def on_message(message: discord.Message):
 
 
 client.run(DISCORD_BOT_TOKEN)
-
