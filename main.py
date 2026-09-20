@@ -1,7 +1,9 @@
 """
 Coin Enricher Bot
-One message: original text + Bubblemaps + Extra Coin Info
-with 🟢 / 🟡 / 🔴 flags. No "safe call" wording.
+Replaces the forwarded coin post with one message:
+original text + Bubblemaps + Extra Coin Info (EST, flags).
+Top 10 / top wallet come from Solana getTokenLargestAccounts first.
+Missing data prints unknown. No "safe call" wording.
 """
 
 import os
@@ -45,6 +47,10 @@ def extract_ca(text: str):
     return candidates[0] if candidates else None
 
 
+def pause():
+    time.sleep(1.2)
+
+
 def birdeye_get(url: str, params: dict, label: str, ca: str):
     try:
         r = requests.get(url, headers=BIRDEYE_HEADERS, params=params, timeout=10)
@@ -63,7 +69,11 @@ def rpc(method: str, params: list):
             timeout=12,
         )
         r.raise_for_status()
-        return r.json().get("result")
+        data = r.json()
+        if data.get("error"):
+            print(f"[rpc {method} error] {data['error']}")
+            return None
+        return data.get("result")
     except Exception as e:
         print(f"[rpc {method} error] {e}")
         return None
@@ -90,10 +100,6 @@ def get_holders(ca: str, limit: int = 20):
     if isinstance(data, list):
         return data
     return data.get("items", []) or []
-
-
-def pause():
-    time.sleep(1.2)
 
 
 def get_dex_pairs(ca: str):
@@ -135,26 +141,7 @@ def get_rugcheck(ca: str):
     return None
 
 
-def holder_amount(h: dict) -> float:
-    raw = h.get("ui_amount", h.get("uiAmount", h.get("amount", 0)))
-    try:
-        return float(raw or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def holder_owner(h: dict) -> str:
-    return (
-        h.get("owner")
-        or h.get("wallet")
-        or h.get("address")
-        or h.get("wallet_address")
-        or ""
-    )
-
-
 def as_pct(value):
-    """Only accept a real 0-100 percent. Drop garbage like 309%."""
     try:
         n = float(value)
     except (TypeError, ValueError):
@@ -193,10 +180,58 @@ def get_onchain_supply(ca: str):
         return None
     value = (result.get("value") or {}) if isinstance(result, dict) else {}
     ui = value.get("uiAmount")
+    amount = value.get("amount")
+    decimals = value.get("decimals")
     try:
-        return float(ui) if ui is not None else None
+        if ui is not None:
+            return float(ui)
+        if amount is not None and decimals is not None:
+            return float(amount) / (10 ** int(decimals))
     except (TypeError, ValueError):
         return None
+    return None
+
+
+def get_largest_pcts(ca: str, supply: float | None):
+    """Top account percents from Solana. #1 is often the LP."""
+    result = rpc("getTokenLargestAccounts", [ca])
+    if not result:
+        return None, None
+    values = result.get("value") if isinstance(result, dict) else None
+    if not values:
+        return None, None
+
+    amounts = []
+    for acc in values:
+        ui = acc.get("uiAmount")
+        try:
+            if ui is not None:
+                amounts.append(float(ui))
+                continue
+        except (TypeError, ValueError):
+            pass
+        try:
+            amounts.append(float(acc.get("amount") or 0))
+        except (TypeError, ValueError):
+            amounts.append(0.0)
+
+    if not amounts:
+        return None, None
+
+    if not supply or supply <= 0:
+        # If RPC amounts look like raw integers, we cannot % without supply.
+        return None, None
+
+    # If amounts look like raw (huge vs UI supply), scale them down.
+    if amounts[0] > supply * 2:
+        # try treating supply as raw-sized too; abort if still insane
+        return None, None
+
+    top1 = as_pct((amounts[0] / supply) * 100)
+    top10 = as_pct((sum(amounts[:10]) / supply) * 100)
+    if top10 is None and sum(amounts[:10]) / supply * 100 > 100:
+        top10 = 100.0
+    return top10, top1
 
 
 def get_wallet_token_pct(wallet: str, mint: str, supply):
@@ -219,7 +254,8 @@ def get_wallet_token_pct(wallet: str, mint: str, supply):
             pass
     if not supply or supply <= 0:
         return 0.0 if held == 0 else None
-    return (held / supply) * 100
+    pct = (held / supply) * 100
+    return as_pct(pct) if pct <= 100 else 100.0
 
 
 def find_creator(pump, rug):
@@ -252,7 +288,7 @@ def authority_on(value) -> bool:
     return True
 
 
-def lp_status(rug) -> str | None:
+def lp_status(rug):
     if not rug:
         return None
     risks = rug.get("risks") or []
@@ -314,8 +350,8 @@ def mark_liq(liq, mcap):
     if liq is None:
         return None, "unknown     ⚪"
     label = money(liq)
-    if mcap and mcap > 0:
-        ratio = mcap / liq if liq else 999
+    if mcap and mcap > 0 and liq:
+        ratio = mcap / liq
         if liq < 3000 or ratio >= 80:
             return "red", f"{label}     🔴 tiny vs mcap"
         if liq < 10000 or ratio >= 25:
@@ -337,7 +373,7 @@ def mark_holders(n):
     return "green", f"{n}     🟢 not thin"
 
 
-def worst_color(colors: list[str]) -> str:
+def worst_color(colors):
     if "red" in colors:
         return "red"
     if "yellow" in colors:
@@ -392,7 +428,11 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
     liq = None
     mcap = None
     if pairs:
-        liqs = [p.get("liquidity", {}).get("usd") for p in pairs if isinstance(p.get("liquidity"), dict)]
+        liqs = [
+            p.get("liquidity", {}).get("usd")
+            for p in pairs
+            if isinstance(p.get("liquidity"), dict)
+        ]
         liqs = [float(x) for x in liqs if x is not None]
         if liqs:
             liq = max(liqs)
@@ -401,45 +441,24 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
         if caps:
             mcap = max(caps)
 
-    top10_pct = None
-    top1_pct = None
+    top10_pct, top1_pct = get_largest_pcts(ca, total_supply)
 
-    # Prefer Rugcheck percents. Birdeye raw amount / supply often explodes past 100%.
-    if rug:
+    if top10_pct is None and rug:
         top_list = rug.get("topHolders") or []
-        if top_list:
-            parts = [as_pct(h.get("pct") or h.get("percent")) for h in top_list[:10]]
-            parts = [p for p in parts if p is not None]
-            if parts:
-                summed = sum(parts)
-                top10_pct = as_pct(summed) or (100.0 if summed > 100 else None)
-                top1_pct = parts[0]
-    if top10_pct is None:
-        top10_pct = parse_top10_from_text(source_text)
-    if top10_pct is None and holders:
-        parts = []
-        for h in holders[:10]:
-            n = as_pct(h.get("percentage") or h.get("percent") or h.get("ui_percentage"))
-            if n is not None:
-                parts.append(n)
+        parts = [as_pct(h.get("pct") or h.get("percent")) for h in top_list[:10]]
+        parts = [p for p in parts if p is not None]
         if parts:
             summed = sum(parts)
             top10_pct = as_pct(summed) or (100.0 if summed > 100 else None)
             top1_pct = top1_pct or parts[0]
-    if top10_pct is None and holders and total_supply and total_supply > 0:
-        guessed = (sum(holder_amount(h) for h in holders[:10]) / total_supply) * 100
-        top10_pct = as_pct(guessed)
-        if holders and top1_pct is None:
-            top1_pct = as_pct((holder_amount(holders[0]) / total_supply) * 100)
+    if top10_pct is None:
+        top10_pct = parse_top10_from_text(source_text)
 
     creator = find_creator(pump, rug)
     dev_pct = None
     if creator and total_supply:
         dev_pct = get_wallet_token_pct(creator, ca, total_supply)
-    if dev_pct is None and creator and holders and total_supply:
-        matched = next((h for h in holders if holder_owner(h) == creator), None)
-        if matched is not None:
-            dev_pct = (holder_amount(matched) / total_supply) * 100
+
     token = (rug or {}).get("token") or {}
     mint_on = authority_on(token.get("mintAuthority")) if rug else None
     freeze_on = authority_on(token.get("freezeAuthority")) if rug else None
@@ -451,6 +470,8 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
             migrated = True
         elif str(ca).endswith("pump"):
             migrated = False
+    elif pairs and any((p.get("dexId") or "").lower() in ("pumpswap", "raydium", "meteora") for p in pairs):
+        migrated = True
 
     colors = []
     t10_c, t10_v = mark_top10(top10_pct)
