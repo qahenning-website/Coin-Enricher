@@ -25,7 +25,8 @@ WATCH_CHANNEL_ID = int(os.environ["WATCH_CHANNEL_ID"])
 SOL_CA_REGEX = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 EASTERN = ZoneInfo("America/New_York")
 RPC_URLS = [
-    "https://solana-rpc.publicnode.com",
+    "https://1rpc.io/solana",
+    "https://solana.drpc.org",
     "https://api.mainnet-beta.solana.com",
 ]
 
