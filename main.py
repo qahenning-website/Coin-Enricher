@@ -154,6 +154,7 @@ def holder_owner(h: dict) -> str:
 
 
 def as_pct(value):
+    """Only accept a real 0-100 percent. Drop garbage like 309%."""
     try:
         n = float(value)
     except (TypeError, ValueError):
@@ -162,6 +163,8 @@ def as_pct(value):
         return None
     if 0 < n <= 1:
         n *= 100
+    if n > 100:
+        return None
     return n
 
 
@@ -400,19 +403,34 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
 
     top10_pct = None
     top1_pct = None
-    if holders and total_supply:
-        top10_pct = (sum(holder_amount(h) for h in holders[:10]) / total_supply) * 100
-        top1_pct = (holder_amount(holders[0]) / total_supply) * 100 if holders else None
-    if top10_pct is None and rug:
+
+    # Prefer Rugcheck percents. Birdeye raw amount / supply often explodes past 100%.
+    if rug:
         top_list = rug.get("topHolders") or []
         if top_list:
             parts = [as_pct(h.get("pct") or h.get("percent")) for h in top_list[:10]]
             parts = [p for p in parts if p is not None]
             if parts:
-                top10_pct = sum(parts)
+                summed = sum(parts)
+                top10_pct = as_pct(summed) or (100.0 if summed > 100 else None)
                 top1_pct = parts[0]
     if top10_pct is None:
         top10_pct = parse_top10_from_text(source_text)
+    if top10_pct is None and holders:
+        parts = []
+        for h in holders[:10]:
+            n = as_pct(h.get("percentage") or h.get("percent") or h.get("ui_percentage"))
+            if n is not None:
+                parts.append(n)
+        if parts:
+            summed = sum(parts)
+            top10_pct = as_pct(summed) or (100.0 if summed > 100 else None)
+            top1_pct = top1_pct or parts[0]
+    if top10_pct is None and holders and total_supply and total_supply > 0:
+        guessed = (sum(holder_amount(h) for h in holders[:10]) / total_supply) * 100
+        top10_pct = as_pct(guessed)
+        if holders and top1_pct is None:
+            top1_pct = as_pct((holder_amount(holders[0]) / total_supply) * 100)
 
     creator = find_creator(pump, rug)
     dev_pct = None
