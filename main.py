@@ -1,9 +1,8 @@
 """
 Coin Enricher Bot
-Replaces the forwarded coin post with one message:
-original text + Bubblemaps + Extra Coin Info (EST, flags).
-Top 10 / top wallet come from Solana getTokenLargestAccounts first.
-Missing data prints unknown. No "safe call" wording.
+One Discord message: original text + Bubblemaps + Extra Coin Info.
+Top 10 / top wallet from Solana getTokenLargestAccounts (multi-RPC).
+Unknown if a field cannot be fetched. No "safe call" text.
 """
 
 import os
@@ -25,13 +24,15 @@ WATCH_CHANNEL_ID = int(os.environ["WATCH_CHANNEL_ID"])
 
 SOL_CA_REGEX = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 EASTERN = ZoneInfo("America/New_York")
-RPC_URL = "https://api.mainnet-beta.solana.com"
+RPC_URLS = [
+    "https://solana-rpc.publicnode.com",
+    "https://api.mainnet-beta.solana.com",
+]
 
 BIRDEYE_HEADERS = {
     "X-API-KEY": BIRDEYE_API_KEY,
     "x-chain": "solana",
 }
-
 COLOR = {"green": 0x3BA55D, "yellow": 0xFEE75C, "red": 0xED4245}
 
 intents = discord.Intents.default()
@@ -40,18 +41,18 @@ client = discord.Client(intents=intents)
 
 
 def extract_ca(text: str):
-    candidates = SOL_CA_REGEX.findall(text or "")
-    for c in candidates:
+    found = SOL_CA_REGEX.findall(text or "")
+    for c in found:
         if any(ch.isdigit() for ch in c):
             return c
-    return candidates[0] if candidates else None
+    return found[0] if found else None
 
 
 def pause():
     time.sleep(1.2)
 
 
-def birdeye_get(url: str, params: dict, label: str, ca: str):
+def birdeye_get(url, params, label, ca):
     try:
         r = requests.get(url, headers=BIRDEYE_HEADERS, params=params, timeout=10)
         r.raise_for_status()
@@ -61,25 +62,27 @@ def birdeye_get(url: str, params: dict, label: str, ca: str):
         return None
 
 
-def rpc(method: str, params: list):
-    try:
-        r = requests.post(
-            RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=12,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("error"):
-            print(f"[rpc {method} error] {data['error']}")
-            return None
-        return data.get("result")
-    except Exception as e:
-        print(f"[rpc {method} error] {e}")
-        return None
+def rpc(method, params):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    last_err = None
+    for url in RPC_URLS:
+        try:
+            r = requests.post(url, json=payload, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("error"):
+                last_err = data["error"]
+                print(f"[rpc {method} {url}] {data['error']}")
+                continue
+            return data.get("result")
+        except Exception as e:
+            last_err = e
+            print(f"[rpc {method} {url}] {e}")
+    print(f"[rpc {method} failed] {last_err}")
+    return None
 
 
-def get_token_overview(ca: str):
+def get_token_overview(ca):
     return birdeye_get(
         "https://public-api.birdeye.so/defi/token_overview",
         {"address": ca},
@@ -88,7 +91,7 @@ def get_token_overview(ca: str):
     )
 
 
-def get_holders(ca: str, limit: int = 20):
+def get_holders(ca, limit=20):
     data = birdeye_get(
         "https://public-api.birdeye.so/defi/v3/token/holder",
         {"address": ca, "offset": 0, "limit": limit},
@@ -102,7 +105,7 @@ def get_holders(ca: str, limit: int = 20):
     return data.get("items", []) or []
 
 
-def get_dex_pairs(ca: str):
+def get_dex_pairs(ca):
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{ca}",
@@ -115,23 +118,21 @@ def get_dex_pairs(ca: str):
         return []
 
 
-def get_pump_coin(ca: str):
+def get_pump_coin(ca):
     for url in (
         f"https://frontend-api.pump.fun/coins/{ca}",
         f"https://frontend-api-v3.pump.fun/coins/{ca}",
     ):
         try:
             r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, dict) and data:
-                    return data
+            if r.status_code == 200 and isinstance(r.json(), dict):
+                return r.json()
         except Exception as e:
             print(f"[pump error] {ca}: {e}")
     return None
 
 
-def get_rugcheck(ca: str):
+def get_rugcheck(ca):
     try:
         r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{ca}/report", timeout=12)
         if r.status_code == 200:
@@ -146,95 +147,90 @@ def as_pct(value):
         n = float(value)
     except (TypeError, ValueError):
         return None
-    if n < 0:
+    if n < 0 or n > 100:
         return None
     if 0 < n <= 1:
         n *= 100
-    if n > 100:
-        return None
+        if n > 100:
+            return None
     return n
 
 
-def parse_top10_from_text(text: str):
+def parse_top10_from_text(text):
     if not text:
         return None
     m = re.search(r"top\s*10[^0-9%]{0,16}(\d+(?:\.\d+)?)\s*%", text, re.I)
-    if not m:
-        return None
-    return as_pct(m.group(1))
+    return as_pct(m.group(1)) if m else None
 
 
-def format_eastern(unix_seconds: int):
+def format_eastern(unix_seconds):
     launched = datetime.fromtimestamp(unix_seconds, tz=timezone.utc)
     launched_et = launched.astimezone(EASTERN)
-    age = datetime.now(timezone.utc) - launched
-    hours = age.total_seconds() / 3600
-    age_str = f"{hours:.1f}h ago" if hours < 48 else f"{hours / 24:.1f}d ago"
-    clock = launched_et.strftime("%Y-%m-%d %I:%M %p") + " EST"
-    return clock, age_str
+    hours = (datetime.now(timezone.utc) - launched).total_seconds() / 3600
+    age = f"{hours:.1f}h ago" if hours < 48 else f"{hours / 24:.1f}d ago"
+    return launched_et.strftime("%Y-%m-%d %I:%M %p") + " EST", age
 
 
-def get_onchain_supply(ca: str):
+def token_supply(ca):
     result = rpc("getTokenSupply", [ca])
-    if not result:
-        return None
-    value = (result.get("value") or {}) if isinstance(result, dict) else {}
-    ui = value.get("uiAmount")
-    amount = value.get("amount")
-    decimals = value.get("decimals")
+    if not isinstance(result, dict):
+        return None, None
+    val = result.get("value") or {}
+    decimals = val.get("decimals")
+    try:
+        decimals = int(decimals) if decimals is not None else None
+    except (TypeError, ValueError):
+        decimals = None
+    ui = val.get("uiAmount")
     try:
         if ui is not None:
-            return float(ui)
-        if amount is not None and decimals is not None:
-            return float(amount) / (10 ** int(decimals))
+            return float(ui), decimals
     except (TypeError, ValueError):
-        return None
-    return None
+        pass
+    try:
+        raw = float(val.get("amount") or 0)
+        if decimals is not None:
+            return raw / (10 ** decimals), decimals
+    except (TypeError, ValueError):
+        pass
+    return None, decimals
 
 
-def get_largest_pcts(ca: str, supply: float | None):
-    """Top account percents from Solana. #1 is often the LP."""
-    result = rpc("getTokenLargestAccounts", [ca])
-    if not result:
-        return None, None
-    values = result.get("value") if isinstance(result, dict) else None
-    if not values:
-        return None, None
-
-    amounts = []
-    for acc in values:
-        ui = acc.get("uiAmount")
+def account_ui_amount(acc, decimals):
+    if acc.get("uiAmount") is not None:
         try:
-            if ui is not None:
-                amounts.append(float(ui))
-                continue
+            return float(acc["uiAmount"])
         except (TypeError, ValueError):
             pass
-        try:
-            amounts.append(float(acc.get("amount") or 0))
-        except (TypeError, ValueError):
-            amounts.append(0.0)
+    try:
+        raw = float(acc.get("amount") or 0)
+        if decimals is not None:
+            return raw / (10 ** decimals)
+        return raw
+    except (TypeError, ValueError):
+        return 0.0
 
+
+def largest_holder_pcts(ca, supply, decimals):
+    result = rpc("getTokenLargestAccounts", [ca])
+    if not isinstance(result, dict):
+        return None, None
+    rows = result.get("value") or []
+    if not rows or not supply or supply <= 0:
+        return None, None
+    amounts = [account_ui_amount(a, decimals) for a in rows]
+    amounts = [a for a in amounts if a >= 0]
     if not amounts:
         return None, None
-
-    if not supply or supply <= 0:
-        # If RPC amounts look like raw integers, we cannot % without supply.
-        return None, None
-
-    # If amounts look like raw (huge vs UI supply), scale them down.
-    if amounts[0] > supply * 2:
-        # try treating supply as raw-sized too; abort if still insane
-        return None, None
-
     top1 = as_pct((amounts[0] / supply) * 100)
-    top10 = as_pct((sum(amounts[:10]) / supply) * 100)
-    if top10 is None and sum(amounts[:10]) / supply * 100 > 100:
+    raw10 = (sum(amounts[:10]) / supply) * 100
+    top10 = as_pct(raw10)
+    if top10 is None and raw10 > 100:
         top10 = 100.0
     return top10, top1
 
 
-def get_wallet_token_pct(wallet: str, mint: str, supply):
+def wallet_token_pct(wallet, mint, supply, decimals):
     result = rpc(
         "getTokenAccountsByOwner",
         [wallet, {"mint": mint}, {"encoding": "jsonParsed"}],
@@ -248,25 +244,22 @@ def get_wallet_token_pct(wallet: str, mint: str, supply):
     for acc in accounts:
         info = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
         tok = info.get("tokenAmount") or {}
-        try:
-            held += float(tok.get("uiAmount") or 0)
-        except (TypeError, ValueError):
-            pass
+        held += account_ui_amount(tok, decimals)
     if not supply or supply <= 0:
         return 0.0 if held == 0 else None
-    pct = (held / supply) * 100
-    return as_pct(pct) if pct <= 100 else 100.0
+    raw = (held / supply) * 100
+    return as_pct(raw) if raw <= 100 else 100.0
 
 
 def find_creator(pump, rug):
     if pump:
-        creator = pump.get("creator") or pump.get("creatorAddress")
-        if creator:
-            return creator
+        c = pump.get("creator") or pump.get("creatorAddress")
+        if c:
+            return c
     if rug:
-        creator = rug.get("creator") or (rug.get("token") or {}).get("creator")
-        if creator:
-            return creator
+        c = rug.get("creator") or (rug.get("token") or {}).get("creator")
+        if c:
+            return c
     return None
 
 
@@ -280,7 +273,7 @@ def money(n):
     return f"${n:.0f}"
 
 
-def authority_on(value) -> bool:
+def authority_on(value):
     if value is None or value == "" or value is False:
         return False
     if isinstance(value, str) and value.lower() in ("none", "null", "0"):
@@ -291,29 +284,30 @@ def authority_on(value) -> bool:
 def lp_status(rug):
     if not rug:
         return None
-    risks = rug.get("risks") or []
-    names = " ".join((r.get("name") or "") + " " + (r.get("description") or "") for r in risks).lower()
-    if "lp unlocked" in names or "unlocked liquidity" in names:
+    blob = " ".join(
+        (r.get("name") or "") + " " + (r.get("description") or "")
+        for r in (rug.get("risks") or [])
+    ).lower()
+    if "lp unlocked" in blob or "unlocked liquidity" in blob:
         return "unlocked"
-    if "lp burned" in names or "burned" in names:
+    if "lp burned" in blob:
         return "burned"
-    markets = rug.get("markets") or []
-    locked_pcts = []
+    locked = []
     burned = False
-    for m in markets:
+    for m in rug.get("markets") or []:
         lp = m.get("lp") or m
         pct = lp.get("lpLockedPct") or lp.get("lockedPct")
         if pct is not None:
             try:
-                locked_pcts.append(float(pct))
+                locked.append(float(pct))
             except (TypeError, ValueError):
                 pass
         if lp.get("lpBurned") or lp.get("burned"):
             burned = True
     if burned:
         return "burned"
-    if locked_pcts:
-        best = max(locked_pcts)
+    if locked:
+        best = max(locked)
         if best >= 95:
             return "locked"
         if best >= 50:
@@ -383,7 +377,7 @@ def worst_color(colors):
     return "yellow"
 
 
-def build_enrichment_embed(ca: str, source_text: str = ""):
+def build_enrichment_embed(ca, source_text=""):
     overview = get_token_overview(ca)
     pause()
     holders = get_holders(ca)
@@ -400,33 +394,31 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
         ts = pump["created_timestamp"]
         unix_time = int(ts / 1000) if ts > 10_000_000_000 else int(ts)
     if not unix_time and pairs:
-        times = [p.get("pairCreatedAt") for p in pairs if p.get("pairCreatedAt")]
-        if times:
-            ms = min(times)
+        created = [p.get("pairCreatedAt") for p in pairs if p.get("pairCreatedAt")]
+        if created:
+            ms = min(created)
             unix_time = int(ms / 1000) if ms > 10_000_000_000 else int(ms)
 
-    total_supply = None
+    supply, decimals = token_supply(ca)
     holder_count = None
     if overview:
-        raw_supply = (
-            overview.get("supply")
-            or overview.get("totalSupply")
-            or overview.get("circulatingSupply")
-        )
-        try:
-            total_supply = float(raw_supply) if raw_supply is not None else None
-        except (TypeError, ValueError):
-            total_supply = None
+        if supply is None:
+            raw = (
+                overview.get("supply")
+                or overview.get("totalSupply")
+                or overview.get("circulatingSupply")
+            )
+            try:
+                supply = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                supply = None
         holder_count = overview.get("holder") or overview.get("holders")
         try:
             holder_count = int(holder_count) if holder_count is not None else None
         except (TypeError, ValueError):
             holder_count = None
-    if not total_supply:
-        total_supply = get_onchain_supply(ca)
 
-    liq = None
-    mcap = None
+    liq = mcap = None
     if pairs:
         liqs = [
             p.get("liquidity", {}).get("usd")
@@ -441,23 +433,25 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
         if caps:
             mcap = max(caps)
 
-    top10_pct, top1_pct = get_largest_pcts(ca, total_supply)
+    top10_pct, top1_pct = largest_holder_pcts(ca, supply, decimals)
 
     if top10_pct is None and rug:
-        top_list = rug.get("topHolders") or []
-        parts = [as_pct(h.get("pct") or h.get("percent")) for h in top_list[:10]]
+        parts = [
+            as_pct(h.get("pct") or h.get("percent"))
+            for h in (rug.get("topHolders") or [])[:10]
+        ]
         parts = [p for p in parts if p is not None]
         if parts:
-            summed = sum(parts)
-            top10_pct = as_pct(summed) or (100.0 if summed > 100 else None)
+            s = sum(parts)
+            top10_pct = as_pct(s) or (100.0 if s > 100 else None)
             top1_pct = top1_pct or parts[0]
     if top10_pct is None:
         top10_pct = parse_top10_from_text(source_text)
 
     creator = find_creator(pump, rug)
     dev_pct = None
-    if creator and total_supply:
-        dev_pct = get_wallet_token_pct(creator, ca, total_supply)
+    if creator and supply:
+        dev_pct = wallet_token_pct(creator, ca, supply, decimals)
 
     token = (rug or {}).get("token") or {}
     mint_on = authority_on(token.get("mintAuthority")) if rug else None
@@ -470,8 +464,10 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
             migrated = True
         elif str(ca).endswith("pump"):
             migrated = False
-    elif pairs and any((p.get("dexId") or "").lower() in ("pumpswap", "raydium", "meteora") for p in pairs):
-        migrated = True
+    if migrated is None and pairs:
+        dexes = {(p.get("dexId") or "").lower() for p in pairs}
+        if dexes & {"pumpswap", "raydium", "meteora"}:
+            migrated = True
 
     colors = []
     t10_c, t10_v = mark_top10(top10_pct)
@@ -482,101 +478,90 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
         if c:
             colors.append(c)
 
-    flag_lines = []
+    flags = []
     if mint_on is True:
         colors.append("red")
-        flag_lines.append("🔴 Mint ON  — they can print more coins")
+        flags.append("🔴 Mint ON  — they can print more coins")
     elif mint_on is False:
         colors.append("green")
-        flag_lines.append("🟢 Mint off")
+        flags.append("🟢 Mint off")
     else:
-        flag_lines.append("⚪ Mint unknown")
+        flags.append("⚪ Mint unknown")
 
     if freeze_on is True:
         colors.append("red")
-        flag_lines.append("🔴 Freeze ON  — they can lock wallets")
+        flags.append("🔴 Freeze ON  — they can lock wallets")
     elif freeze_on is False:
         colors.append("green")
-        flag_lines.append("🟢 Freeze off")
+        flags.append("🟢 Freeze off")
     else:
-        flag_lines.append("⚪ Freeze unknown")
+        flags.append("⚪ Freeze unknown")
 
     if lp == "unlocked":
         colors.append("red")
-        flag_lines.append("🔴 LP unlocked  — they can pull the pool")
+        flags.append("🔴 LP unlocked  — they can pull the pool")
     elif lp == "partial":
         colors.append("yellow")
-        flag_lines.append("🟡 LP partly locked")
+        flags.append("🟡 LP partly locked")
     elif lp in ("burned", "locked"):
         colors.append("green")
-        flag_lines.append(f"🟢 LP {lp}")
+        flags.append(f"🟢 LP {lp}")
     else:
-        flag_lines.append("⚪ LP unknown")
+        flags.append("⚪ LP unknown")
 
     if migrated is False:
         colors.append("yellow")
-        flag_lines.append("🟡 Still on Pump")
+        flags.append("🟡 Still on Pump")
     elif migrated is True:
         colors.append("green")
-        flag_lines.append("🟢 Migrated")
+        flags.append("🟢 Migrated")
     else:
-        flag_lines.append("⚪ Curve unknown")
+        flags.append("⚪ Curve unknown")
 
     if top1_pct is not None and top1_pct >= 20:
         colors.append("red")
-        flag_lines.append(f"🔴 Top wallet {top1_pct:.1f}%")
+        flags.append(f"🔴 Top wallet {top1_pct:.1f}%")
     elif top1_pct is not None and top1_pct >= 10:
         colors.append("yellow")
-        flag_lines.append(f"🟡 Top wallet {top1_pct:.1f}%")
+        flags.append(f"🟡 Top wallet {top1_pct:.1f}%")
     elif top1_pct is not None:
-        flag_lines.append(f"🟢 Top wallet {top1_pct:.1f}%")
+        flags.append(f"🟢 Top wallet {top1_pct:.1f}%")
     else:
-        flag_lines.append("⚪ Top wallet unknown")
+        flags.append("⚪ Top wallet unknown")
 
-    tone = worst_color(colors)
-    embed = discord.Embed(title="Extra Coin Info", color=COLOR[tone])
-
+    embed = discord.Embed(title="Extra Coin Info", color=COLOR[worst_color(colors)])
     if unix_time:
-        clock, age_str = format_eastern(int(unix_time))
-        embed.add_field(name="Launched", value=f"{clock} ({age_str})", inline=False)
+        clock, age = format_eastern(int(unix_time))
+        embed.add_field(name="Launched", value=f"{clock} ({age})", inline=False)
     else:
         embed.add_field(name="Launched", value="unknown     ⚪", inline=False)
-
     embed.add_field(name="Top 10", value=t10_v, inline=False)
     embed.add_field(name="Dev", value=dv_v, inline=False)
     embed.add_field(name="Liq", value=lq_v, inline=False)
     embed.add_field(name="Holders", value=hd_v, inline=False)
-    embed.add_field(name="Flags", value="\n".join(flag_lines), inline=False)
+    embed.add_field(name="Flags", value="\n".join(flags), inline=False)
     return embed
 
 
-def bubble_url(ca: str) -> str:
+def bubble_url(ca):
     return f"https://v2.bubblemaps.io/map?address={ca}&chain=solana"
 
 
-def with_bubblemaps_link(text: str, ca: str) -> str:
+def with_bubblemaps_link(text, ca):
     link = f"[Bubblemaps]({bubble_url(ca)})"
     raw = text or ""
     if re.search(r"\[Bubblemaps", raw, re.I):
         return raw
-    patched = re.sub(
-        r"(\[DexTools\]\([^)]+\))",
-        rf"\1 · {link}",
-        raw,
-        count=1,
-        flags=re.I,
-    )
-    if patched != raw:
-        return patched
-    patched = re.sub(
-        r"(\[DexScreener\]\([^)]+\))",
-        rf"\1 · {link}",
-        raw,
-        count=1,
-        flags=re.I,
-    )
-    if patched != raw:
-        return patched
+    for label in ("DexTools", "DexScreener"):
+        patched = re.sub(
+            rf"(\[{label}\]\([^)]+\))",
+            rf"\1 · {link}",
+            raw,
+            count=1,
+            flags=re.I,
+        )
+        if patched != raw:
+            return patched
     return (raw.rstrip() + f" · {link}").strip()
 
 
@@ -592,28 +577,26 @@ async def on_message(message: discord.Message):
     if message.channel.id != WATCH_CHANNEL_ID:
         return
 
-    source_text = message.content or ""
-    if message.embeds:
-        for e in message.embeds:
-            source_text += " " + (e.title or "") + " " + (e.description or "")
-            for f in e.fields:
-                source_text += " " + (f.name or "") + " " + (f.value or "")
+    source = message.content or ""
+    for e in message.embeds:
+        source += " " + (e.title or "") + " " + (e.description or "")
+        for f in e.fields:
+            source += " " + (f.name or "") + " " + (f.value or "")
 
-    ca = extract_ca(source_text) or extract_ca(message.content or "")
+    ca = extract_ca(source) or extract_ca(message.content or "")
     if not ca:
         return
 
     await asyncio.sleep(1)
-    extra = build_enrichment_embed(ca, source_text)
+    extra = build_enrichment_embed(ca, source)
     combined = with_bubblemaps_link(message.content or "", ca)
-
-    original_embeds = []
+    embeds = []
     for e in message.embeds:
         try:
-            original_embeds.append(discord.Embed.from_dict(e.to_dict()))
+            embeds.append(discord.Embed.from_dict(e.to_dict()))
         except Exception:
             pass
-    embeds = (original_embeds + [extra])[:10]
+    embeds = (embeds + [extra])[:10]
 
     try:
         await message.delete()
