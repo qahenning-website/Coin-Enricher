@@ -1,8 +1,7 @@
 """
 Coin Enricher Bot
-Replaces the forwarded coin post with one message:
-  original text + Bubblemaps link + Extra Coin Info embed
-  (launched EST, top 10 %, dev holding %)
+One message: original text + Bubblemaps + Extra Coin Info
+with 🟢 / 🟡 / 🔴 flags. No "safe call" wording.
 """
 
 import os
@@ -30,6 +29,8 @@ BIRDEYE_HEADERS = {
     "X-API-KEY": BIRDEYE_API_KEY,
     "x-chain": "solana",
 }
+
+COLOR = {"green": 0x3BA55D, "yellow": 0xFEE75C, "red": 0xED4245}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -91,22 +92,21 @@ def get_holders(ca: str, limit: int = 20):
     return data.get("items", []) or []
 
 
-def get_dexscreener_created(ca: str):
+def pause():
+    time.sleep(1.2)
+
+
+def get_dex_pairs(ca: str):
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{ca}",
             timeout=10,
         )
         r.raise_for_status()
-        pairs = r.json().get("pairs") or []
-        times = [p.get("pairCreatedAt") for p in pairs if p.get("pairCreatedAt")]
-        if not times:
-            return None
-        ms = min(times)
-        return int(ms / 1000) if ms > 10_000_000_000 else int(ms)
+        return r.json().get("pairs") or []
     except Exception as e:
         print(f"[dexscreener error] {ca}: {e}")
-        return None
+        return []
 
 
 def get_pump_coin(ca: str):
@@ -210,9 +210,8 @@ def get_wallet_token_pct(wallet: str, mint: str, supply):
     for acc in accounts:
         info = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
         tok = info.get("tokenAmount") or {}
-        ui = tok.get("uiAmount")
         try:
-            held += float(ui or 0)
+            held += float(tok.get("uiAmount") or 0)
         except (TypeError, ValueError):
             pass
     if not supply or supply <= 0:
@@ -220,7 +219,7 @@ def get_wallet_token_pct(wallet: str, mint: str, supply):
     return (held / supply) * 100
 
 
-def find_creator(ca: str, pump, rug):
+def find_creator(pump, rug):
     if pump:
         creator = pump.get("creator") or pump.get("creatorAddress")
         if creator:
@@ -232,30 +231,143 @@ def find_creator(ca: str, pump, rug):
     return None
 
 
+def money(n):
+    if n is None:
+        return None
+    if n >= 1_000_000:
+        return f"${n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"${n / 1_000:.1f}k"
+    return f"${n:.0f}"
+
+
+def authority_on(value) -> bool:
+    if value is None or value == "" or value is False:
+        return False
+    if isinstance(value, str) and value.lower() in ("none", "null", "0"):
+        return False
+    return True
+
+
+def lp_status(rug) -> str | None:
+    if not rug:
+        return None
+    risks = rug.get("risks") or []
+    names = " ".join((r.get("name") or "") + " " + (r.get("description") or "") for r in risks).lower()
+    if "lp unlocked" in names or "unlocked liquidity" in names:
+        return "unlocked"
+    if "lp burned" in names or "burned" in names:
+        return "burned"
+    markets = rug.get("markets") or []
+    locked_pcts = []
+    burned = False
+    for m in markets:
+        lp = m.get("lp") or m
+        pct = lp.get("lpLockedPct") or lp.get("lockedPct")
+        if pct is not None:
+            try:
+                locked_pcts.append(float(pct))
+            except (TypeError, ValueError):
+                pass
+        if lp.get("lpBurned") or lp.get("burned"):
+            burned = True
+    if burned:
+        return "burned"
+    if locked_pcts:
+        best = max(locked_pcts)
+        if best >= 95:
+            return "locked"
+        if best >= 50:
+            return "partial"
+        return "unlocked"
+    if rug.get("lpLocked") is True:
+        return "locked"
+    if rug.get("lpLocked") is False:
+        return "unlocked"
+    return None
+
+
+def mark_top10(pct):
+    if pct is None:
+        return None, "unknown     ⚪"
+    if pct >= 50:
+        return "red", f"{pct:.1f}%     🔴 whales own a lot"
+    if pct >= 30:
+        return "yellow", f"{pct:.1f}%     🟡 kinda concentrated"
+    return "green", f"{pct:.1f}%     🟢 spread out"
+
+
+def mark_dev(pct):
+    if pct is None:
+        return None, "unknown     ⚪"
+    if pct <= 0.05:
+        return "red", f"{pct:.2f}%     🔴 already sold"
+    if pct < 1.5:
+        return "yellow", f"{pct:.2f}%     🟡 small bag"
+    return "green", f"{pct:.2f}%     🟢 still holding"
+
+
+def mark_liq(liq, mcap):
+    if liq is None:
+        return None, "unknown     ⚪"
+    label = money(liq)
+    if mcap and mcap > 0:
+        ratio = mcap / liq if liq else 999
+        if liq < 3000 or ratio >= 80:
+            return "red", f"{label}     🔴 tiny vs mcap"
+        if liq < 10000 or ratio >= 25:
+            return "yellow", f"{label}     🟡 thin"
+    if liq < 3000:
+        return "red", f"{label}     🔴 tiny"
+    if liq < 10000:
+        return "yellow", f"{label}     🟡 thin"
+    return "green", f"{label}     🟢 ok vs mcap"
+
+
+def mark_holders(n):
+    if n is None:
+        return None, "unknown     ⚪"
+    if n < 40:
+        return "red", f"{n}     🔴 almost nobody in"
+    if n < 150:
+        return "yellow", f"{n}     🟡 small crowd"
+    return "green", f"{n}     🟢 not thin"
+
+
+def worst_color(colors: list[str]) -> str:
+    if "red" in colors:
+        return "red"
+    if "yellow" in colors:
+        return "yellow"
+    if "green" in colors:
+        return "green"
+    return "yellow"
+
+
 def build_enrichment_embed(ca: str, source_text: str = ""):
     overview = get_token_overview(ca)
-    time.sleep(1.2)
+    pause()
     holders = get_holders(ca)
     if not holders:
-        time.sleep(1.4)
+        pause()
         holders = get_holders(ca)
 
+    pairs = get_dex_pairs(ca)
     pump = get_pump_coin(ca)
     rug = get_rugcheck(ca)
-
-    embed = discord.Embed(title="Extra Coin Info", color=0x5865F2)
 
     unix_time = None
     if pump and pump.get("created_timestamp"):
         ts = pump["created_timestamp"]
         unix_time = int(ts / 1000) if ts > 10_000_000_000 else int(ts)
-    if not unix_time:
-        unix_time = get_dexscreener_created(ca)
-    if unix_time:
-        clock, age_str = format_eastern(int(unix_time))
-        embed.add_field(name="Launched", value=f"{clock} ({age_str})", inline=False)
+    if not unix_time and pairs:
+        times = [p.get("pairCreatedAt") for p in pairs if p.get("pairCreatedAt")]
+        if times:
+            ms = min(times)
+            unix_time = int(ms / 1000) if ms > 10_000_000_000 else int(ms)
 
     total_supply = None
+    holder_count = None
     if overview:
         raw_supply = (
             overview.get("supply")
@@ -266,36 +378,43 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
             total_supply = float(raw_supply) if raw_supply is not None else None
         except (TypeError, ValueError):
             total_supply = None
+        holder_count = overview.get("holder") or overview.get("holders")
+        try:
+            holder_count = int(holder_count) if holder_count is not None else None
+        except (TypeError, ValueError):
+            holder_count = None
     if not total_supply:
         total_supply = get_onchain_supply(ca)
 
+    liq = None
+    mcap = None
+    if pairs:
+        liqs = [p.get("liquidity", {}).get("usd") for p in pairs if isinstance(p.get("liquidity"), dict)]
+        liqs = [float(x) for x in liqs if x is not None]
+        if liqs:
+            liq = max(liqs)
+        caps = [p.get("marketCap") or p.get("fdv") for p in pairs]
+        caps = [float(x) for x in caps if x is not None]
+        if caps:
+            mcap = max(caps)
+
     top10_pct = None
+    top1_pct = None
     if holders and total_supply:
         top10_pct = (sum(holder_amount(h) for h in holders[:10]) / total_supply) * 100
-    if top10_pct is None and holders:
-        parts = []
-        for h in holders[:10]:
-            n = as_pct(h.get("percentage") or h.get("percent") or h.get("ui_percentage"))
-            if n is not None:
-                parts.append(n)
-        if parts:
-            top10_pct = sum(parts)
+        top1_pct = (holder_amount(holders[0]) / total_supply) * 100 if holders else None
     if top10_pct is None and rug:
         top_list = rug.get("topHolders") or []
         if top_list:
-            s = 0.0
-            for h in top_list[:10]:
-                n = as_pct(h.get("pct") or h.get("percent"))
-                if n is not None:
-                    s += n
-            if s:
-                top10_pct = s
+            parts = [as_pct(h.get("pct") or h.get("percent")) for h in top_list[:10]]
+            parts = [p for p in parts if p is not None]
+            if parts:
+                top10_pct = sum(parts)
+                top1_pct = parts[0]
     if top10_pct is None:
         top10_pct = parse_top10_from_text(source_text)
-    if top10_pct is not None:
-        embed.add_field(name="Top 10 Holders", value=f"{top10_pct:.1f}%", inline=True)
 
-    creator = find_creator(ca, pump, rug)
+    creator = find_creator(pump, rug)
     dev_pct = None
     if creator and total_supply:
         dev_pct = get_wallet_token_pct(creator, ca, total_supply)
@@ -303,10 +422,92 @@ def build_enrichment_embed(ca: str, source_text: str = ""):
         matched = next((h for h in holders if holder_owner(h) == creator), None)
         if matched is not None:
             dev_pct = (holder_amount(matched) / total_supply) * 100
-    if dev_pct is None:
-        dev_pct = 0.0
+    token = (rug or {}).get("token") or {}
+    mint_on = authority_on(token.get("mintAuthority")) if rug else None
+    freeze_on = authority_on(token.get("freezeAuthority")) if rug else None
+    lp = lp_status(rug)
 
-    embed.add_field(name="Dev Holding", value=f"{dev_pct:.2f}%", inline=True)
+    migrated = None
+    if pump:
+        if pump.get("complete") or pump.get("raydium_pool") or pump.get("migrated"):
+            migrated = True
+        elif str(ca).endswith("pump"):
+            migrated = False
+
+    colors = []
+    t10_c, t10_v = mark_top10(top10_pct)
+    dv_c, dv_v = mark_dev(dev_pct)
+    lq_c, lq_v = mark_liq(liq, mcap)
+    hd_c, hd_v = mark_holders(holder_count)
+    for c in (t10_c, dv_c, lq_c, hd_c):
+        if c:
+            colors.append(c)
+
+    flag_lines = []
+    if mint_on is True:
+        colors.append("red")
+        flag_lines.append("🔴 Mint ON  — they can print more coins")
+    elif mint_on is False:
+        colors.append("green")
+        flag_lines.append("🟢 Mint off")
+    else:
+        flag_lines.append("⚪ Mint unknown")
+
+    if freeze_on is True:
+        colors.append("red")
+        flag_lines.append("🔴 Freeze ON  — they can lock wallets")
+    elif freeze_on is False:
+        colors.append("green")
+        flag_lines.append("🟢 Freeze off")
+    else:
+        flag_lines.append("⚪ Freeze unknown")
+
+    if lp == "unlocked":
+        colors.append("red")
+        flag_lines.append("🔴 LP unlocked  — they can pull the pool")
+    elif lp == "partial":
+        colors.append("yellow")
+        flag_lines.append("🟡 LP partly locked")
+    elif lp in ("burned", "locked"):
+        colors.append("green")
+        flag_lines.append(f"🟢 LP {lp}")
+    else:
+        flag_lines.append("⚪ LP unknown")
+
+    if migrated is False:
+        colors.append("yellow")
+        flag_lines.append("🟡 Still on Pump")
+    elif migrated is True:
+        colors.append("green")
+        flag_lines.append("🟢 Migrated")
+    else:
+        flag_lines.append("⚪ Curve unknown")
+
+    if top1_pct is not None and top1_pct >= 20:
+        colors.append("red")
+        flag_lines.append(f"🔴 Top wallet {top1_pct:.1f}%")
+    elif top1_pct is not None and top1_pct >= 10:
+        colors.append("yellow")
+        flag_lines.append(f"🟡 Top wallet {top1_pct:.1f}%")
+    elif top1_pct is not None:
+        flag_lines.append(f"🟢 Top wallet {top1_pct:.1f}%")
+    else:
+        flag_lines.append("⚪ Top wallet unknown")
+
+    tone = worst_color(colors)
+    embed = discord.Embed(title="Extra Coin Info", color=COLOR[tone])
+
+    if unix_time:
+        clock, age_str = format_eastern(int(unix_time))
+        embed.add_field(name="Launched", value=f"{clock} ({age_str})", inline=False)
+    else:
+        embed.add_field(name="Launched", value="unknown     ⚪", inline=False)
+
+    embed.add_field(name="Top 10", value=t10_v, inline=False)
+    embed.add_field(name="Dev", value=dv_v, inline=False)
+    embed.add_field(name="Liq", value=lq_v, inline=False)
+    embed.add_field(name="Holders", value=hd_v, inline=False)
+    embed.add_field(name="Flags", value="\n".join(flag_lines), inline=False)
     return embed
 
 
@@ -319,7 +520,6 @@ def with_bubblemaps_link(text: str, ca: str) -> str:
     raw = text or ""
     if re.search(r"\[Bubblemaps", raw, re.I):
         return raw
-
     patched = re.sub(
         r"(\[DexTools\]\([^)]+\))",
         rf"\1 · {link}",
@@ -329,7 +529,6 @@ def with_bubblemaps_link(text: str, ca: str) -> str:
     )
     if patched != raw:
         return patched
-
     patched = re.sub(
         r"(\[DexScreener\]\([^)]+\))",
         rf"\1 · {link}",
@@ -339,7 +538,6 @@ def with_bubblemaps_link(text: str, ca: str) -> str:
     )
     if patched != raw:
         return patched
-
     return (raw.rstrip() + f" · {link}").strip()
 
 
@@ -368,8 +566,8 @@ async def on_message(message: discord.Message):
 
     await asyncio.sleep(1)
     extra = build_enrichment_embed(ca, source_text)
-
     combined = with_bubblemaps_link(message.content or "", ca)
+
     original_embeds = []
     for e in message.embeds:
         try:
