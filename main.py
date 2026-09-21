@@ -24,10 +24,19 @@ WATCH_CHANNEL_ID = int(os.environ["WATCH_CHANNEL_ID"])
 
 SOL_CA_REGEX = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 EASTERN = ZoneInfo("America/New_York")
+def helius_rpc_url(raw: str) -> str:
+    raw = (raw or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    return f"https://mainnet.helius-rpc.com/?api-key={raw}"
+
+
 RPC_URLS = [
     url
     for url in (
-        os.environ.get("SOLANA_RPC_URL", "").strip(),
+        helius_rpc_url(os.environ.get("SOLANA_RPC_URL", "")),
         "https://1rpc.io/solana",
         "https://solana.drpc.org",
         "https://api.mainnet-beta.solana.com",
